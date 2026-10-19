@@ -1,0 +1,111 @@
+name: Land scan
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_notification:
+        description: 'Also send a test phone notification'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # daily heartbeat commit (keeps the schedule from being auto-disabled)
+  actions: write    # prune old state caches / keep workflow enabled
+  pages: write
+  id-token: write
+
+concurrency:
+  group: land-scan
+  cancel-in-progress: false
+
+env:
+  STATE_DIR: ${{ github.workspace }}/state
+  STATICRYPT_SALT: '099b247bc5b40cef7b18478cf84e036e'   # not secret; fixed so "remember me" survives redeploys
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pdftotext
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends poppler-utils >/dev/null 2>&1 || \
+            (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends poppler-utils >/dev/null)
+          pdftotext -v 2>&1 | head -1
+
+      - name: Restore scanner state (seen lots + fetch cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: state-
+
+      - name: Scan sources
+        id: scan
+        env:
+          BRIEFS_JSON: ${{ secrets.BRIEFS_JSON }}
+        run: |
+          mkdir -p state
+          python3 scan.py --all --report "$RUNNER_TEMP/report.json" --quiet
+
+      - name: Save scanner state
+        if: always() && steps.scan.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Notify phone + build site
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 publish.py "$RUNNER_TEMP/report.json"
+
+      - name: Test notification
+        if: ${{ inputs.test_notification }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 publish.py --test
+
+      - name: Encrypt site (StatiCrypt)
+        env:
+          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
+        run: |
+          npx --yes staticrypt@3.5.4 site/index.html -p "$SITE_PASSWORD" -s "$STATICRYPT_SALT" -d public -c false --short --remember 30 \
+            --template-title "Land scanner" --template-instructions "Enter the site password." \
+            --template-color-primary "#1f4e79" --template-color-secondary "#f4f5f7" >/dev/null
+          rm -rf site
+          touch public/.nojekyll
+          ls -la public
+          ! grep -q "Source health" public/index.html   # fail if plaintext leaked
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Keep-alive (daily heartbeat commit + prune old caches)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          today=$(TZ=Australia/Perth date +%F)
+          if [ "$(cat heartbeat.txt 2>/dev/null)" != "$today" ]; then
+            echo "$today" > heartbeat.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add heartbeat.txt && git commit -qm "heartbeat $today" && git push -q || echo "heartbeat push failed"
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/scan.yml/enable" || true
+          fi
+          # keep only the 3 newest state caches
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=state-&sort=created_at&direction=desc&per_page=100" \
+            --jq '.actions_caches[3:][].id' | while read id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" >/dev/null || true; done

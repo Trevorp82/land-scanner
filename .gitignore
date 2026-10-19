@@ -1,0 +1,13 @@
+cache/
+state/
+site/
+public/
+seen.json
+briefs.json
+*.html
+*.log
+*.err
+*.out
+run*.json
+report.json
+__pycache__/
